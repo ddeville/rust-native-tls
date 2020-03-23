@@ -11,13 +11,92 @@ use self::openssl::ssl::{
     SslVerifyMode,
 };
 use self::openssl::x509::{X509, store::X509StoreBuilder, X509VerifyResult};
+use std::borrow;
 use std::error;
 use std::fmt;
 use std::io;
 use std::sync::Once;
 
-use {Protocol, TlsAcceptorBuilder, TlsConnectorBuilder};
+use {
+    CipherSuiteSet, Protocol, TlsAcceptorBuilder, TlsBulkEncryptionAlgorithm, TlsConnectorBuilder,
+    TlsHashAlgorithm, TlsKeyExchangeAlgorithm, TlsSignatureAlgorithm,
+};
 use self::openssl::pkey::Private;
+
+const CIPHER_STRING_SUFFIX: &[&str] = &[
+    "!aNULL",
+    "!eNULL",
+    "!IDEA",
+    "!SEED",
+    "!SRP",
+    "!PSK",
+    "@STRENGTH",
+];
+
+fn cartesian_product(
+    xs: impl IntoIterator<Item = Vec<&'static str>>,
+    ys: impl IntoIterator<Item = &'static str> + Clone,
+) -> Vec<Vec<&'static str>> {
+    xs.into_iter()
+        .flat_map(move |x| ys.clone().into_iter().map(move |y| [&x, &[y][..]].concat()))
+        .collect()
+}
+
+fn expand_algorithms(cipher_suites: &CipherSuiteSet) -> String {
+    let mut cipher_suite_strings: Vec<Vec<&'static str>> = vec![];
+
+    cipher_suite_strings.extend(cipher_suites.key_exchange.iter().map(|alg| {
+        vec![match alg {
+            TlsKeyExchangeAlgorithm::Dhe => "DHE",
+            TlsKeyExchangeAlgorithm::Ecdhe => "ECDHE",
+            TlsKeyExchangeAlgorithm::Rsa => "kRSA",
+            TlsKeyExchangeAlgorithm::__NonExhaustive => unreachable!(),
+        }]
+    }));
+
+    cipher_suite_strings = cartesian_product(
+        cipher_suite_strings,
+        cipher_suites.signature.iter().map(|alg| match alg {
+            TlsSignatureAlgorithm::Dss => "aDSS",
+            TlsSignatureAlgorithm::Ecdsa => "aECDSA",
+            TlsSignatureAlgorithm::Rsa => "aRSA",
+            TlsSignatureAlgorithm::__NonExhaustive => unreachable!(),
+        }),
+    );
+    cipher_suite_strings = cartesian_product(
+        cipher_suite_strings,
+        cipher_suites.bulk_encryption.iter().map(|alg| match alg {
+            TlsBulkEncryptionAlgorithm::Aes128 => "AES128",
+            TlsBulkEncryptionAlgorithm::Aes256 => "AES256",
+            TlsBulkEncryptionAlgorithm::Des => "DES",
+            TlsBulkEncryptionAlgorithm::Rc2 => "RC2",
+            TlsBulkEncryptionAlgorithm::Rc4 => "RC4",
+            TlsBulkEncryptionAlgorithm::TripleDes => "3DES",
+            TlsBulkEncryptionAlgorithm::__NonExhaustive => unreachable!(),
+        }),
+    );
+    cipher_suite_strings = cartesian_product(
+        cipher_suite_strings,
+        cipher_suites.hash.iter().map(|alg| match alg {
+            TlsHashAlgorithm::Md5 => "MD5",
+            TlsHashAlgorithm::Sha1 => "SHA1",
+            TlsHashAlgorithm::Sha256 => "SHA256",
+            TlsHashAlgorithm::Sha384 => "SHA384",
+            TlsHashAlgorithm::__NonExhaustive => unreachable!(),
+        }),
+    );
+
+    cipher_suite_strings
+        .into_iter()
+        .map(move |parts| borrow::Cow::Owned(parts.join("+")))
+        .chain(
+            CIPHER_STRING_SUFFIX
+                .iter()
+                .map(|s| borrow::Cow::Borrowed(*s)),
+        )
+        .collect::<Vec<_>>()
+        .join(":")
+}
 
 #[cfg(have_min_max_version)]
 fn supported_protocols(
@@ -262,6 +341,9 @@ impl TlsConnector {
                 connector.add_extra_chain_cert(cert.to_owned())?;
             }
         }
+        if let Some(ref cipher_suites) = builder.cipher_suites {
+            connector.set_cipher_list(&expand_algorithms(cipher_suites))?;
+        }
         supported_protocols(builder.min_protocol, builder.max_protocol, &mut connector)?;
 
         if builder.disable_built_in_roots {
@@ -410,5 +492,36 @@ impl<S: io::Read + io::Write> io::Write for TlsStream<S> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_algorithms_basic() {
+        assert_eq!(
+            expand_algorithms(&CipherSuiteSet {
+                key_exchange: vec![TlsKeyExchangeAlgorithm::Dhe, TlsKeyExchangeAlgorithm::Ecdhe],
+                signature: vec![TlsSignatureAlgorithm::Rsa],
+                bulk_encryption: vec![
+                    TlsBulkEncryptionAlgorithm::Aes128,
+                    TlsBulkEncryptionAlgorithm::Aes256
+                ],
+                hash: vec![TlsHashAlgorithm::Sha256, TlsHashAlgorithm::Sha384],
+            }),
+            "\
+            DHE+aRSA+AES128+SHA256:\
+            DHE+aRSA+AES128+SHA384:\
+            DHE+aRSA+AES256+SHA256:\
+            DHE+aRSA+AES256+SHA384:\
+            ECDHE+aRSA+AES128+SHA256:\
+            ECDHE+aRSA+AES128+SHA384:\
+            ECDHE+aRSA+AES256+SHA256:\
+            ECDHE+aRSA+AES256+SHA384:\
+            !aNULL:!eNULL:!IDEA:!SEED:!SRP:!PSK:@STRENGTH\
+            ",
+        );
     }
 }
