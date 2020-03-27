@@ -7,6 +7,7 @@ use self::security_framework::base;
 use self::security_framework::certificate::SecCertificate;
 use self::security_framework::identity::SecIdentity;
 use self::security_framework::import_export::{ImportedIdentity, Pkcs12ImportOptions};
+use self::security_framework::os::macos::import_export::Pkcs12ImportOptionsExt;
 use self::security_framework::secure_transport::{
     self, ClientBuilder, SslConnectionType, SslContext, SslProtocol, SslProtocolSide,
 };
@@ -128,10 +129,9 @@ impl Identity {
                 keychain
             }
         };
-        let imports = Pkcs12ImportOptions::new()
-            .passphrase(pass)
-            .keychain(keychain)
-            .import(buf)?;
+        let mut import_opts = Pkcs12ImportOptions::new();
+        <Pkcs12ImportOptions as Pkcs12ImportOptionsExt>::keychain(&mut import_opts, keychain);
+        let imports = import_opts.passphrase(pass).import(buf)?;
         Ok(imports)
     }
 
@@ -260,6 +260,7 @@ pub struct TlsConnector {
     max_protocol: Option<Protocol>,
     roots: Vec<SecCertificate>,
     use_sni: bool,
+    session_tickets_enabled: bool,
     danger_accept_invalid_hostnames: bool,
     danger_accept_invalid_certs: bool,
     disable_built_in_roots: bool,
@@ -277,6 +278,7 @@ impl TlsConnector {
                 .map(|c| (c.0).0.clone())
                 .collect(),
             use_sni: builder.use_sni,
+            session_tickets_enabled: builder.session_tickets_enabled,
             danger_accept_invalid_hostnames: builder.accept_invalid_hostnames,
             danger_accept_invalid_certs: builder.accept_invalid_certs,
             disable_built_in_roots: builder.disable_built_in_roots,
@@ -299,6 +301,7 @@ impl TlsConnector {
         }
         builder.anchor_certificates(&self.roots);
         builder.use_sni(self.use_sni);
+        builder.enable_session_tickets(self.session_tickets_enabled);
         builder.danger_accept_invalid_hostnames(self.danger_accept_invalid_hostnames);
         builder.danger_accept_invalid_certs(self.danger_accept_invalid_certs);
         builder.trust_anchor_certificates_only(self.disable_built_in_roots);

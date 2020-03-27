@@ -328,6 +328,7 @@ pub struct TlsConnectorBuilder {
     accept_invalid_hostnames: bool,
     use_sni: bool,
     disable_built_in_roots: bool,
+    session_tickets_enabled: bool,
 }
 
 impl TlsConnectorBuilder {
@@ -418,6 +419,17 @@ impl TlsConnectorBuilder {
         self
     }
 
+    /// Controls the use of RFC 5077 TLS session ticket resumption.
+    ///
+    /// Defaults to `false`.
+    pub fn session_tickets_enabled(
+        &mut self,
+        session_tickets_enabled: bool,
+    ) -> &mut TlsConnectorBuilder {
+        self.session_tickets_enabled = session_tickets_enabled;
+        self
+    }
+
     /// Creates a new `TlsConnector`.
     pub fn build(&self) -> Result<TlsConnector> {
         let connector = imp::TlsConnector::new(self)?;
@@ -464,6 +476,7 @@ impl TlsConnector {
             accept_invalid_certs: false,
             accept_invalid_hostnames: false,
             disable_built_in_roots: false,
+            session_tickets_enabled: false,
         }
     }
 
@@ -477,8 +490,8 @@ impl TlsConnector {
     /// which can be used to restart the handshake when the socket is ready
     /// again.
     ///
-    /// The domain is ignored if both SNI and hostname verification are
-    /// disabled.
+    /// The domain is ignored if SNI, hostname verification, and TLS session
+    /// ticket resumption are all disabled.
     pub fn connect<S>(
         &self,
         domain: &str,
