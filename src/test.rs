@@ -51,6 +51,51 @@ mod tests {
     }
 
     #[test]
+    fn connect_no_root_certs() {
+        let builder = p!(TlsConnector::builder().disable_built_in_roots(true).build());
+        let s = p!(TcpStream::connect("google.com:443"));
+        assert!(builder.connect("google.com", s).is_err());
+    }
+
+    #[test]
+    fn server_no_root_certs() {
+        let buf = include_bytes!("../test/identity.p12");
+        let identity = p!(Identity::from_pkcs12(buf, "mypass"));
+        let builder = p!(TlsAcceptor::new(identity));
+
+        let listener = p!(TcpListener::bind("0.0.0.0:0"));
+        let port = p!(listener.local_addr()).port();
+
+        let j = thread::spawn(move || {
+            let socket = p!(listener.accept()).0;
+            let mut socket = p!(builder.accept(socket));
+
+            let mut buf = [0; 5];
+            p!(socket.read_exact(&mut buf));
+            assert_eq!(&buf, b"hello");
+
+            p!(socket.write_all(b"world"));
+        });
+
+        let root_ca = include_bytes!("../test/root-ca.der");
+        let root_ca = Certificate::from_der(root_ca).unwrap();
+
+        let socket = p!(TcpStream::connect(("localhost", port)));
+        let builder = p!(TlsConnector::builder()
+            .disable_built_in_roots(true)
+            .add_root_certificate(root_ca)
+            .build());
+        let mut socket = p!(builder.connect("foobar.com", socket));
+
+        p!(socket.write_all(b"hello"));
+        let mut buf = vec![];
+        p!(socket.read_to_end(&mut buf));
+        assert_eq!(buf, b"world");
+
+        p!(j.join());
+    }
+
+    #[test]
     fn server() {
         let buf = include_bytes!("../test/identity.p12");
         let identity = p!(Identity::from_pkcs12(buf, "mypass"));
@@ -371,5 +416,56 @@ mod tests {
         assert_eq!(buf, b"world");
 
         p!(j.join());
+    }
+
+    #[test]
+    fn alpn_google_h2() {
+        let builder = p!(TlsConnector::builder().request_alpns(&[b"h2"]).build());
+        let s = p!(TcpStream::connect("google.com:443"));
+        let socket = p!(builder.connect("google.com", s));
+
+        assert_eq!(p!(socket.negotiated_alpn()), Some(b"h2".to_vec()));
+    }
+
+    #[test]
+    fn alpn_google_invalid() {
+        let builder = p!(TlsConnector::builder().request_alpns(&[b"h2c"]).build());
+        let s = p!(TcpStream::connect("google.com:443"));
+        let socket = p!(builder.connect("google.com", s));
+
+        assert_eq!(p!(socket.negotiated_alpn()), None);
+    }
+
+    #[test]
+    fn alpn_google_none() {
+        let builder = p!(TlsConnector::new());
+        let s = p!(TcpStream::connect("google.com:443"));
+        let socket = p!(builder.connect("google.com", s));
+
+        assert_eq!(p!(socket.negotiated_alpn()), None);
+    }
+
+    #[test]
+    fn badssl_cipher_suites_no_rsa() {
+        let builder = p!(TlsConnector::builder().supported_cipher_suites(
+            // Oddly, on Windows, allowing RSA key exchange, but not RSA signature algorithms still
+            // allows a successful TLS connection, despite there being no non-RSA signature cipher
+            // suites in the Mozilla Intermediate set AFAICT. Removing RSA from the key exchange
+            // algorithms causes this test to work as expected.
+            CipherSuiteSet::default()
+                .key_exchange_algorithms(&[TlsKeyExchangeAlgorithm::Ecdhe])
+                .signature_algorithms(&[TlsSignatureAlgorithm::Ecdsa])
+        ).build());
+        let s = p!(TcpStream::connect("mozilla-intermediate.badssl.com:443"));
+        assert!(builder.connect("mozilla-intermediate.badssl.com", s).is_err());
+    }
+
+    #[test]
+    fn badssl_cipher_suites_default() {
+        let builder = p!(TlsConnector::builder().supported_cipher_suites(
+            CipherSuiteSet::default()
+        ).build());
+        let s = p!(TcpStream::connect("mozilla-intermediate.badssl.com:443"));
+        p!(builder.connect("mozilla-intermediate.badssl.com", s));
     }
 }

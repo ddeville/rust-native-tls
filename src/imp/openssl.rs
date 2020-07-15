@@ -1,23 +1,254 @@
+extern crate linked_hash_set;
+extern crate once_cell;
 extern crate openssl;
 extern crate openssl_probe;
 
+use self::linked_hash_set::LinkedHashSet;
+use self::once_cell::sync::OnceCell;
 use self::openssl::error::ErrorStack;
+use self::openssl::ex_data::Index;
 use self::openssl::hash::MessageDigest;
 use self::openssl::nid::Nid;
 use self::openssl::pkcs12::Pkcs12;
 use self::openssl::pkey::PKey;
 use self::openssl::ssl::{
-    self, MidHandshakeSslStream, SslAcceptor, SslConnector, SslContextBuilder, SslMethod,
-    SslVerifyMode,
+    self, MidHandshakeSslStream, Ssl, SslAcceptor, SslConnector, SslContextBuilder, SslMethod,
+    SslSession, SslSessionCacheMode, SslSessionRef, SslVerifyMode,
 };
-use self::openssl::x509::{X509, X509VerifyResult};
+use self::openssl::x509::{X509, store::X509StoreBuilder, X509VerifyResult};
+use std::borrow::{Borrow, Cow};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::error;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::io;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 
-use {Protocol, TlsAcceptorBuilder, TlsConnectorBuilder};
+use {
+    CipherSuiteSet, Protocol, TlsAcceptorBuilder, TlsBulkEncryptionAlgorithm, TlsConnectorBuilder,
+    TlsHashAlgorithm, TlsKeyExchangeAlgorithm, TlsSignatureAlgorithm,
+};
 use self::openssl::pkey::Private;
+
+const CIPHER_STRING_SUFFIX: &[&str] = &[
+    "!aNULL",
+    "!eNULL",
+    "!IDEA",
+    "!SEED",
+    "!SRP",
+    "!PSK",
+    "@STRENGTH",
+];
+
+fn cartesian_product(
+    xs: impl IntoIterator<Item = Vec<&'static str>>,
+    ys: impl IntoIterator<Item = &'static str> + Clone,
+) -> Vec<Vec<&'static str>> {
+    xs.into_iter()
+        .flat_map(move |x| ys.clone().into_iter().map(move |y| [&x, &[y][..]].concat()))
+        .collect()
+}
+
+/// AES-GCM ciphersuites aren't included in AES128 or AES256. However, specifying `AESGCM` in the
+/// cipher string doesn't allow us to specify the bitwidth of the AES cipher used, nor does it
+/// allow us to specify the bitwidth of the SHA algorithm.
+fn expand_gcm_algorithms(cipher_suites: &CipherSuiteSet) -> Vec<&'static str> {
+    let first = cipher_suites
+        .key_exchange
+        .iter()
+        .flat_map(|alg| -> &[&str] {
+            match alg {
+                TlsKeyExchangeAlgorithm::Dhe => &[
+                    "DHE-RSA-AES128-GCM-SHA256",
+                    "DHE-RSA-AES256-GCM-SHA384",
+                    "DHE-DSS-AES128-GCM-SHA256",
+                    "DHE-DSS-AES256-GCM-SHA384",
+                ],
+                TlsKeyExchangeAlgorithm::Ecdhe => &[
+                    "ECDHE-RSA-AES128-GCM-SHA256",
+                    "ECDHE-RSA-AES256-GCM-SHA384",
+                    "ECDHE-ECDSA-AES128-GCM-SHA256",
+                    "ECDHE-ECDSA-AES256-GCM-SHA384",
+                ],
+                TlsKeyExchangeAlgorithm::Rsa => &["AES128-GCM-SHA256", "AES256-GCM-SHA384"],
+                TlsKeyExchangeAlgorithm::__NonExhaustive => unreachable!(),
+            }
+        })
+        .copied();
+    let rest: &[HashSet<_>] = &[
+        cipher_suites
+            .signature
+            .iter()
+            .flat_map(|alg| -> &[&str] {
+                match alg {
+                    TlsSignatureAlgorithm::Dss => &[
+                        "DH-DSS-AES128-GCM-SHA256",
+                        "DH-DSS-AES256-GCM-SHA384",
+                        "DHE-DSS-AES128-GCM-SHA256",
+                        "DHE-DSS-AES256-GCM-SHA384",
+                    ],
+                    TlsSignatureAlgorithm::Ecdsa => &[
+                        "ECDH-ECDSA-AES128-GCM-SHA256",
+                        "ECDH-ECDSA-AES256-GCM-SHA384",
+                        "ECDHE-ECDSA-AES128-GCM-SHA256",
+                        "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    ],
+                    TlsSignatureAlgorithm::Rsa => &[
+                        "AES128-GCM-SHA256",
+                        "AES256-GCM-SHA384",
+                        "DH-RSA-AES128-GCM-SHA256",
+                        "DH-RSA-AES256-GCM-SHA384",
+                        "DHE-RSA-AES128-GCM-SHA256",
+                        "DHE-RSA-AES256-GCM-SHA384",
+                        "ECDH-RSA-AES128-GCM-SHA256",
+                        "ECDH-RSA-AES256-GCM-SHA384",
+                        "ECDHE-RSA-AES128-GCM-SHA256",
+                        "ECDHE-RSA-AES256-GCM-SHA384",
+                    ],
+                    TlsSignatureAlgorithm::__NonExhaustive => unreachable!(),
+                }
+            })
+            .copied()
+            .collect(),
+        cipher_suites
+            .bulk_encryption
+            .iter()
+            .flat_map(|alg| -> &[&str] {
+                match alg {
+                    TlsBulkEncryptionAlgorithm::Aes128 => &[
+                        "AES128-GCM-SHA256",
+                        "DH-RSA-AES128-GCM-SHA256",
+                        "DH-DSS-AES128-GCM-SHA256",
+                        "DHE-RSA-AES128-GCM-SHA256",
+                        "DHE-DSS-AES128-GCM-SHA256",
+                        "ECDH-RSA-AES128-GCM-SHA256",
+                        "ECDH-ECDSA-AES128-GCM-SHA256",
+                        "ECDHE-RSA-AES128-GCM-SHA256",
+                        "ECDHE-ECDSA-AES128-GCM-SHA256",
+                    ],
+                    TlsBulkEncryptionAlgorithm::Aes256 => &[
+                        "AES256-GCM-SHA384",
+                        "DH-RSA-AES256-GCM-SHA384",
+                        "DH-DSS-AES256-GCM-SHA384",
+                        "DHE-RSA-AES256-GCM-SHA384",
+                        "DHE-DSS-AES256-GCM-SHA384",
+                        "ECDH-RSA-AES256-GCM-SHA384",
+                        "ECDH-ECDSA-AES256-GCM-SHA384",
+                        "ECDHE-RSA-AES256-GCM-SHA384",
+                        "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    ],
+                    TlsBulkEncryptionAlgorithm::Des => &[],
+                    TlsBulkEncryptionAlgorithm::Rc2 => &[],
+                    TlsBulkEncryptionAlgorithm::Rc4 => &[],
+                    TlsBulkEncryptionAlgorithm::TripleDes => &[],
+                    TlsBulkEncryptionAlgorithm::__NonExhaustive => unreachable!(),
+                }
+            })
+            .copied()
+            .collect(),
+        cipher_suites
+            .hash
+            .iter()
+            .flat_map(|alg| -> &[&str] {
+                match alg {
+                    TlsHashAlgorithm::Md5 => &[],
+                    TlsHashAlgorithm::Sha1 => &[],
+                    TlsHashAlgorithm::Sha256 => &[
+                        "AES128-GCM-SHA256",
+                        "DH-RSA-AES128-GCM-SHA256",
+                        "DH-DSS-AES128-GCM-SHA256",
+                        "DHE-RSA-AES128-GCM-SHA256",
+                        "DHE-DSS-AES128-GCM-SHA256",
+                        "ECDH-RSA-AES128-GCM-SHA256",
+                        "ECDH-ECDSA-AES128-GCM-SHA256",
+                        "ECDHE-RSA-AES128-GCM-SHA256",
+                        "ECDHE-ECDSA-AES128-GCM-SHA256",
+                    ],
+                    TlsHashAlgorithm::Sha384 => &[
+                        "AES256-GCM-SHA384",
+                        "DH-RSA-AES256-GCM-SHA384",
+                        "DH-DSS-AES256-GCM-SHA384",
+                        "DHE-RSA-AES256-GCM-SHA384",
+                        "DHE-DSS-AES256-GCM-SHA384",
+                        "ECDH-RSA-AES256-GCM-SHA384",
+                        "ECDH-ECDSA-AES256-GCM-SHA384",
+                        "ECDHE-RSA-AES256-GCM-SHA384",
+                        "ECDHE-ECDSA-AES256-GCM-SHA384",
+                    ],
+                    TlsHashAlgorithm::__NonExhaustive => unreachable!(),
+                }
+            })
+            .copied()
+            .collect(),
+    ];
+
+    first
+        .filter(|alg| rest.iter().all(|algs| algs.contains(alg)))
+        .collect()
+}
+
+fn expand_algorithms(cipher_suites: &CipherSuiteSet) -> String {
+    let mut cipher_suite_strings: Vec<Vec<&'static str>> = vec![];
+
+    cipher_suite_strings.extend(cipher_suites.key_exchange.iter().map(|alg| {
+        vec![match alg {
+            TlsKeyExchangeAlgorithm::Dhe => "DHE",
+            TlsKeyExchangeAlgorithm::Ecdhe => "ECDHE",
+            TlsKeyExchangeAlgorithm::Rsa => "kRSA",
+            TlsKeyExchangeAlgorithm::__NonExhaustive => unreachable!(),
+        }]
+    }));
+
+    cipher_suite_strings = cartesian_product(
+        cipher_suite_strings,
+        cipher_suites.signature.iter().map(|alg| match alg {
+            TlsSignatureAlgorithm::Dss => "aDSS",
+            TlsSignatureAlgorithm::Ecdsa => "aECDSA",
+            TlsSignatureAlgorithm::Rsa => "aRSA",
+            TlsSignatureAlgorithm::__NonExhaustive => unreachable!(),
+        }),
+    );
+    cipher_suite_strings = cartesian_product(
+        cipher_suite_strings,
+        cipher_suites.bulk_encryption.iter().map(|alg| match alg {
+            TlsBulkEncryptionAlgorithm::Aes128 => "AES128",
+            TlsBulkEncryptionAlgorithm::Aes256 => "AES256",
+            TlsBulkEncryptionAlgorithm::Des => "DES",
+            TlsBulkEncryptionAlgorithm::Rc2 => "RC2",
+            TlsBulkEncryptionAlgorithm::Rc4 => "RC4",
+            TlsBulkEncryptionAlgorithm::TripleDes => "3DES",
+            TlsBulkEncryptionAlgorithm::__NonExhaustive => unreachable!(),
+        }),
+    );
+    cipher_suite_strings = cartesian_product(
+        cipher_suite_strings,
+        cipher_suites.hash.iter().map(|alg| match alg {
+            TlsHashAlgorithm::Md5 => "MD5",
+            TlsHashAlgorithm::Sha1 => "SHA1",
+            TlsHashAlgorithm::Sha256 => "SHA256",
+            TlsHashAlgorithm::Sha384 => "SHA384",
+            TlsHashAlgorithm::__NonExhaustive => unreachable!(),
+        }),
+    );
+
+    // GCM first, as `@STRENGTH` sorts purely on bitwidth, and otherwise respects the initial
+    // ordering. GCM is generally preferred over CBC for performance and security reasons.
+    expand_gcm_algorithms(cipher_suites)
+        .into_iter()
+        .map(Cow::Borrowed)
+        .chain(
+            cipher_suite_strings
+                .into_iter()
+                .map(|parts| Cow::Owned(parts.join("+"))),
+        )
+        .chain(
+            CIPHER_STRING_SUFFIX
+                .iter()
+                .map(|s| Cow::Borrowed(*s)),
+        )
+        .collect::<Vec<_>>()
+        .join(":")
+}
 
 #[cfg(have_min_max_version)]
 fn supported_protocols(
@@ -91,7 +322,7 @@ fn supported_protocols(
 
 fn init_trust() {
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| openssl_probe::init_ssl_cert_env_vars());
+    ONCE.call_once(openssl_probe::init_ssl_cert_env_vars);
 }
 
 #[cfg(target_os = "android")]
@@ -158,7 +389,7 @@ impl Identity {
         Ok(Identity {
             pkey: parsed.pkey,
             cert: parsed.cert,
-            chain: parsed.chain.into_iter().flat_map(|x| x).collect(),
+            chain: parsed.chain.into_iter().flatten().collect(),
         })
     }
 }
@@ -248,6 +479,8 @@ pub struct TlsConnector {
     use_sni: bool,
     accept_invalid_hostnames: bool,
     accept_invalid_certs: bool,
+    session_tickets_enabled: bool,
+    session_cache: Arc<Mutex<SessionCache>>,
 }
 
 impl TlsConnector {
@@ -262,7 +495,14 @@ impl TlsConnector {
                 connector.add_extra_chain_cert(cert.to_owned())?;
             }
         }
+        if let Some(ref cipher_suites) = builder.cipher_suites {
+            connector.set_cipher_list(&expand_algorithms(cipher_suites))?;
+        }
         supported_protocols(builder.min_protocol, builder.max_protocol, &mut connector)?;
+
+        if builder.disable_built_in_roots {
+            connector.set_cert_store(X509StoreBuilder::new()?.build());
+        }
 
         for cert in &builder.root_certificates {
             if let Err(err) = connector.cert_store_mut().add_cert((cert.0).0.clone()) {
@@ -270,14 +510,52 @@ impl TlsConnector {
             }
         }
 
+        if !builder.alpn.is_empty() {
+            // Wire format is each alpn preceded by its length as a byte.
+            let mut alpn_wire_format = Vec::with_capacity(
+                builder.alpn.iter().map(Vec::len).sum::<usize>() + builder.alpn.len(),
+            );
+            for alpn in &builder.alpn {
+                alpn_wire_format.push(alpn.len() as u8);
+                alpn_wire_format.extend(alpn);
+            }
+            connector.set_alpn_protos(&alpn_wire_format)?;
+        }
+
         #[cfg(target_os = "android")]
         load_android_root_certs(&mut connector)?;
+
+        let session_cache = Arc::new(Mutex::new(SessionCache::new()));
+        if builder.session_tickets_enabled {
+            connector.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+
+            connector.set_new_session_callback({
+                let session_cache = session_cache.clone();
+                move |ssl, session| {
+                    if let Some(key) = key_index().ok().and_then(|idx| ssl.ex_data(idx)) {
+                        if let Ok(mut session_cache) = session_cache.lock() {
+                            session_cache.insert(key.clone(), session);
+                        }
+                    }
+                }
+            });
+            connector.set_remove_session_callback({
+                let session_cache = session_cache.clone();
+                move |_, session| {
+                    if let Ok(mut session_cache) = session_cache.lock() {
+                        session_cache.remove(session);
+                    }
+                }
+            });
+        }
 
         Ok(TlsConnector {
             connector: connector.build(),
             use_sni: builder.use_sni,
             accept_invalid_hostnames: builder.accept_invalid_hostnames,
             accept_invalid_certs: builder.accept_invalid_certs,
+            session_tickets_enabled: builder.session_tickets_enabled,
+            session_cache,
         })
     }
 
@@ -292,6 +570,23 @@ impl TlsConnector {
             .verify_hostname(!self.accept_invalid_hostnames);
         if self.accept_invalid_certs {
             ssl.set_verify(SslVerifyMode::NONE);
+        }
+        if self.session_tickets_enabled {
+            let key = SessionKey {
+                host: domain.to_string(),
+            };
+
+            if let Ok(mut session_cache) = self.session_cache.lock() {
+                if let Some(session) = session_cache.get(&key) {
+                    // Note: the `unsafe`-ty here is because the `session` is required to come from the
+                    // same SSL_CTX that the ssl object (`ssl`) is from, since it maintains internal
+                    // pointers and refcounts. Here, we only have one SSL_CTX, so this is safe.
+                    unsafe { ssl.set_session(&session)? };
+                }
+            }
+
+            let idx = key_index()?;
+            ssl.set_ex_data(idx, key);
         }
 
         let s = ssl.connect(domain, stream)?;
@@ -351,6 +646,10 @@ impl<S: io::Read + io::Write> TlsStream<S> {
         Ok(self.0.ssl().peer_certificate().map(Certificate))
     }
 
+    pub fn negotiated_alpn(&self) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.0.ssl().selected_alpn_protocol().map(|alpn| alpn.to_vec()))
+    }
+
     pub fn tls_server_end_point(&self) -> Result<Option<Vec<u8>>, Error> {
         let cert = if self.0.ssl().is_server() {
             self.0.ssl().certificate().map(|x| x.to_owned())
@@ -406,5 +705,184 @@ impl<S: io::Read + io::Write> io::Write for TlsStream<S> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
+    }
+}
+
+fn key_index() -> Result<Index<Ssl, SessionKey>, ErrorStack> {
+    static IDX: OnceCell<Index<Ssl, SessionKey>> = OnceCell::new();
+    IDX.get_or_try_init(|| Ssl::new_ex_index()).map(|v| *v)
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+pub struct SessionKey {
+    pub host: String,
+}
+
+#[derive(Clone)]
+struct HashSession(SslSession);
+
+impl PartialEq for HashSession {
+    fn eq(&self, other: &HashSession) -> bool {
+        self.0.id() == other.0.id()
+    }
+}
+
+impl Eq for HashSession {}
+
+impl Hash for HashSession {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        self.0.id().hash(state);
+    }
+}
+
+impl Borrow<[u8]> for HashSession {
+    fn borrow(&self) -> &[u8] {
+        self.0.id()
+    }
+}
+
+pub struct SessionCache {
+    sessions: HashMap<SessionKey, LinkedHashSet<HashSession>>,
+    reverse: HashMap<HashSession, SessionKey>,
+}
+
+impl SessionCache {
+    pub fn new() -> SessionCache {
+        SessionCache {
+            sessions: HashMap::new(),
+            reverse: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, key: SessionKey, session: SslSession) {
+        let session = HashSession(session);
+
+        self.sessions
+            .entry(key.clone())
+            .or_insert_with(LinkedHashSet::new)
+            .insert(session.clone());
+        self.reverse.insert(session.clone(), key);
+    }
+
+    pub fn get(&mut self, key: &SessionKey) -> Option<SslSession> {
+        let session = {
+            let sessions = self.sessions.get_mut(key)?;
+            sessions.front().cloned()?.0
+        };
+
+        #[cfg(ossl111)]
+        {
+            use self::openssl::ssl::SslVersion;
+
+            // https://tools.ietf.org/html/rfc8446#appendix-C.4
+            // OpenSSL will remove the session from its cache after the handshake completes anyway, but this ensures
+            // that concurrent handshakes don't end up with the same session.
+            if session.protocol_version() == SslVersion::TLS1_3 {
+                self.remove(&session);
+            }
+        }
+
+        Some(session)
+    }
+
+    pub fn remove(&mut self, session: &SslSessionRef) {
+        let key = match self.reverse.remove(session.id()) {
+            Some(key) => key,
+            None => return,
+        };
+
+        if let Entry::Occupied(mut sessions) = self.sessions.entry(key) {
+            sessions.get_mut().remove(session.id());
+            if sessions.get().is_empty() {
+                sessions.remove();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    use super::*;
+    use crate::TlsConnector;
+
+    fn connect_and_assert(tls: &TlsConnector, domain: &str, port: u16, should_resume: bool) {
+        let s = TcpStream::connect((domain, port)).unwrap();
+        let mut stream = tls.connect(domain, s).unwrap();
+
+        // Must write to the stream, as OpenSSL doesn't appear to call the
+        // session callback until we do.
+        stream.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        let mut result = vec![];
+        stream.read_to_end(&mut result).unwrap();
+
+        assert_eq!((stream.0).0.ssl().session_reused(), should_resume);
+
+        // Must shut down properly, or OpenSSL will invalidate the session.
+        stream.shutdown().unwrap();
+    }
+
+    #[test]
+    fn connect_no_session_ticket_resumption() {
+        let tls = TlsConnector::new().unwrap();
+        connect_and_assert(&tls, "google.com", 443, false);
+        connect_and_assert(&tls, "google.com", 443, false);
+    }
+
+    #[test]
+    fn connect_session_ticket_resumption() {
+        let mut builder = TlsConnector::builder();
+        builder.session_tickets_enabled(true);
+        let tls = builder.build().unwrap();
+
+        connect_and_assert(&tls, "google.com", 443, false);
+        connect_and_assert(&tls, "google.com", 443, true);
+    }
+
+    #[test]
+    fn connect_session_ticket_resumption_two_sites() {
+        let mut builder = TlsConnector::builder();
+        builder.session_tickets_enabled(true);
+        let tls = builder.build().unwrap();
+
+        connect_and_assert(&tls, "google.com", 443, false);
+        connect_and_assert(&tls, "mozilla.org", 443, false);
+        connect_and_assert(&tls, "google.com", 443, true);
+        connect_and_assert(&tls, "mozilla.org", 443, true);
+    }
+
+    #[test]
+    fn expand_algorithms_basic() {
+        assert_eq!(
+            expand_algorithms(&CipherSuiteSet {
+                key_exchange: vec![TlsKeyExchangeAlgorithm::Dhe, TlsKeyExchangeAlgorithm::Ecdhe],
+                signature: vec![TlsSignatureAlgorithm::Rsa],
+                bulk_encryption: vec![
+                    TlsBulkEncryptionAlgorithm::Aes128,
+                    TlsBulkEncryptionAlgorithm::Aes256
+                ],
+                hash: vec![TlsHashAlgorithm::Sha256, TlsHashAlgorithm::Sha384],
+            }),
+            "\
+            DHE-RSA-AES128-GCM-SHA256:\
+            DHE-RSA-AES256-GCM-SHA384:\
+            ECDHE-RSA-AES128-GCM-SHA256:\
+            ECDHE-RSA-AES256-GCM-SHA384:\
+            DHE+aRSA+AES128+SHA256:\
+            DHE+aRSA+AES128+SHA384:\
+            DHE+aRSA+AES256+SHA256:\
+            DHE+aRSA+AES256+SHA384:\
+            ECDHE+aRSA+AES128+SHA256:\
+            ECDHE+aRSA+AES128+SHA384:\
+            ECDHE+aRSA+AES256+SHA256:\
+            ECDHE+aRSA+AES256+SHA384:\
+            !aNULL:!eNULL:!IDEA:!SEED:!SRP:!PSK:@STRENGTH\
+            ",
+        );
     }
 }
